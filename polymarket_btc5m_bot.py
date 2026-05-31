@@ -1,12 +1,9 @@
 """
-Polymarket BTC 5-Minute Dual-Strike Bot — v2
+Polymarket BTC 5-Minute Dual-Strike Bot — v3
 =============================================
-Fixes vs v1:
-  - Dedicated price ticker thread (1s interval, CLOB orderbook)
-  - Trade logic thread runs separately from price thread
-  - Resolve thread never blocks price updates
-  - Polymarket clock alignment: all timing from system UTC epoch, not uptime
-  - Verbose tick logging: every price refresh logged to dashboard
+Fix: CLOB /book endpoint was returning 0.99 for both tokens (empty orderbook fallback).
+     Correct real-time price source: CLOB /price?token_id=X&side=buy (best ask, no auth needed)
+     Fallback: Gamma outcomePrices (re-fetched every tick, not cached)
 """
 
 import os, time, json, threading, logging
@@ -17,19 +14,18 @@ from flask import Flask, render_template_string
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 DEMO_MODE        = True
 STARTING_BALANCE = 1000.0
-TRADE1_SHARES    = 15       # Early trade shares
-TRADE2_SHARES    = 25       # Value trade shares
-MAX_ENTRY_PRICE  = 0.92     # Skip if overpriced
-MIN_ENTRY_PRICE  = 0.30     # Skip if no conviction
-VALUE_THRESHOLD  = 0.82     # Trade 2: only enter if token still below this
-TAKER_FEE        = 0.02     # 2% Polymarket taker fee
+TRADE1_SHARES    = 15
+TRADE2_SHARES    = 25
+MAX_ENTRY_PRICE  = 0.92
+MIN_ENTRY_PRICE  = 0.30
+VALUE_THRESHOLD  = 0.82     # Trade 2 only if token still below this
+TAKER_FEE        = 0.02
 TRADE1_OFFSET    = 60       # Seconds into window → Trade 1
 TRADE2_OFFSET    = 210      # Seconds into window → Trade 2
-PRICE_INTERVAL   = 1        # Seconds between price refreshes (ticker thread)
-TRADE_INTERVAL   = 1        # Seconds between trade-logic checks
+PRICE_INTERVAL   = 1        # Price ticker refresh (seconds)
 
-GAMMA_API        = "https://gamma-api.polymarket.com"
-CLOB_API         = "https://clob.polymarket.com"
+GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API  = "https://clob.polymarket.com"
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -48,7 +44,7 @@ state = {
     "down_price":         0.0,
     "up_token":           None,
     "down_token":         None,
-    "market_id":          None,
+    "price_source":       "—",   # "CLOB" or "Gamma"
     "positions":          [],
     "closed_trades":      [],
     "log_lines":          [],
@@ -85,22 +81,108 @@ def add_log(msg):
         if len(state["log_lines"]) > 60:
             state["log_lines"].pop(0)
 
-# ─── API CALLS ────────────────────────────────────────────────────────────────
-def fetch_gamma_event(window_ts):
-    """Fetch event metadata from Gamma API (market IDs, token IDs)."""
-    url = f"{GAMMA_API}/events?slug={window_slug(window_ts)}"
+# ─── PRICE FETCHING — THREE METHODS, BEST AVAILABLE ──────────────────────────
+
+def fetch_clob_price(token_id, side="buy"):
+    """
+    CLOB /price endpoint — best ask (buy side) for a token.
+    Returns float or None. No auth required.
+    Docs: GET /price?token_id=<id>&side=buy
+    """
     try:
+        r = requests.get(
+            f"{CLOB_API}/price",
+            params={"token_id": token_id, "side": side},
+            timeout=5
+        )
+        if r.status_code == 200:
+            data = r.json()
+            p = float(data.get("price", 0))
+            if 0.01 <= p <= 0.99:   # Sanity check — reject 0.99/0.00 defaults
+                return p, "CLOB"
+        return None, None
+    except Exception as e:
+        return None, None
+
+def fetch_clob_midpoint(token_id):
+    """
+    CLOB /midpoint — mid price between best bid and best ask.
+    More stable than best-ask alone.
+    """
+    try:
+        r = requests.get(
+            f"{CLOB_API}/midpoint",
+            params={"token_id": token_id},
+            timeout=5
+        )
+        if r.status_code == 200:
+            data = r.json()
+            p = float(data.get("mid", 0))
+            if 0.01 <= p <= 0.99:
+                return p, "CLOB-mid"
+        return None, None
+    except:
+        return None, None
+
+def fetch_gamma_prices(window_ts):
+    """
+    Gamma API outcomePrices — refreshed every tick, not cached.
+    Used as fallback when CLOB is unavailable.
+    Returns (up_price, down_price) or (None, None)
+    """
+    try:
+        url = f"{GAMMA_API}/events?slug={window_slug(window_ts)}"
         r = requests.get(url, timeout=8)
         data = r.json()
         if not data:
-            return None
-        return data[0]
+            return None, None
+        market = data[0]["markets"][0]
+        prices = json.loads(market.get("outcomePrices", "[0.5,0.5]"))
+        up  = float(prices[0])
+        down = float(prices[1])
+        # outcomePrices hitting 0.95+ means window is resolving — valid
+        # but both being 0.99 is impossible → reject
+        if up == 0.99 and down == 0.99:
+            return None, None
+        return up, down
+    except:
+        return None, None
+
+def get_live_prices(up_token, down_token, window_ts):
+    """
+    Try CLOB /price → CLOB /midpoint → Gamma outcomePrices.
+    Returns (up_price, down_price, source_label)
+    """
+    # Try CLOB /price first
+    up_p, src = fetch_clob_price(up_token)
+    dn_p, _   = fetch_clob_price(down_token)
+    if up_p and dn_p:
+        return up_p, dn_p, "CLOB/price"
+
+    # Try CLOB /midpoint
+    up_p, src = fetch_clob_midpoint(up_token)
+    dn_p, _   = fetch_clob_midpoint(down_token)
+    if up_p and dn_p:
+        return up_p, dn_p, "CLOB/mid"
+
+    # Fallback: Gamma outcomePrices (re-fetched, not cached)
+    up_p, dn_p = fetch_gamma_prices(window_ts)
+    if up_p and dn_p:
+        return up_p, dn_p, "Gamma"
+
+    return None, None, "None"
+
+# ─── GAMMA EVENT PARSING ──────────────────────────────────────────────────────
+def fetch_gamma_event(window_ts):
+    try:
+        r = requests.get(f"{GAMMA_API}/events?slug={window_slug(window_ts)}", timeout=8)
+        data = r.json()
+        return data[0] if data else None
     except Exception as e:
-        add_log(f"⚠️ Gamma API error: {e}")
+        add_log(f"⚠️ Gamma error: {e}")
         return None
 
 def parse_gamma_event(event):
-    """Extract token IDs and current prices from a Gamma event."""
     try:
         market    = event["markets"][0]
         token_ids = json.loads(market["clobTokenIds"])
@@ -108,39 +190,15 @@ def parse_gamma_event(event):
         return {
             "market_id":  market["id"],
             "up_token":   token_ids[0],
-            "down_token":  token_ids[1],
+            "down_token": token_ids[1],
             "up_price":   float(prices[0]),
-            "down_price":  float(prices[1]),
+            "down_price": float(prices[1]),
         }
     except Exception as e:
-        add_log(f"⚠️ Gamma parse error: {e}")
-        return None
-
-def fetch_clob_best_price(token_id):
-    """
-    Fetch real-time best ask price from CLOB orderbook.
-    Best ask = cheapest price you can BUY at right now.
-    Returns float price or None on error.
-    """
-    try:
-        r = requests.get(f"{CLOB_API}/book?token_id={token_id}", timeout=5)
-        book = r.json()
-        asks = book.get("asks", [])
-        if asks:
-            # asks are sorted ascending, [0] = lowest ask = best price to buy
-            return float(asks[0]["price"])
-        return None
-    except Exception as e:
-        add_log(f"⚠️ CLOB error (token {str(token_id)[:8]}…): {e}")
+        add_log(f"⚠️ Parse error: {e}")
         return None
 
 def get_prev_result(prev_window_ts):
-    """
-    Check if previous window has resolved.
-    outcomePrices[0] >= 0.95 → UP won
-    outcomePrices[1] >= 0.95 → DOWN won
-    Returns 'UP', 'DOWN', or None
-    """
     event = fetch_gamma_event(prev_window_ts)
     if not event:
         return None
@@ -153,12 +211,12 @@ def get_prev_result(prev_window_ts):
         return "DOWN"
     return None
 
-# ─── DEMO TRADE EXECUTION ─────────────────────────────────────────────────────
+# ─── DEMO TRADE ───────────────────────────────────────────────────────────────
 def execute_demo_trade(direction, shares, entry_price, trade_num, window_ts):
     cost = shares * entry_price * (1 + TAKER_FEE)
     with lock:
         if state["balance"] < cost:
-            add_log(f"⚠️  Insufficient balance for T{trade_num}. Need ${cost:.2f}, have ${state['balance']:.2f}")
+            add_log(f"⚠️  Insufficient balance for T{trade_num}. Need ${cost:.2f}")
             return False
         state["balance"] -= cost
         state["positions"].append({
@@ -195,25 +253,20 @@ def resolve_window(window_ts, winning_direction):
 
 # ─── THREAD 1: PRICE TICKER ──────────────────────────────────────────────────
 def price_ticker_thread():
-    """
-    Runs every 1 second. Fetches live UP/DOWN prices from CLOB.
-    Completely independent — never blocked by trade logic or resolves.
-    """
-    add_log("📡 Price ticker started (CLOB, 1s interval)")
+    add_log("📡 Price ticker started (1s, CLOB/price → CLOB/mid → Gamma fallback)")
     last_loaded_window = None
 
     while True:
         try:
             win_ts = current_window_ts()
 
-            # Load token IDs when window changes (from Gamma)
+            # Load token IDs when window changes
             with lock:
                 up_token   = state["up_token"]
                 down_token = state["down_token"]
-                current_w  = state["current_window"]
+                loaded_win = state["current_window"]
 
-            if win_ts != current_w or up_token is None:
-                # New window — load market structure from Gamma
+            if win_ts != loaded_win or up_token is None:
                 event = fetch_gamma_event(win_ts)
                 if event:
                     m = parse_gamma_event(event)
@@ -223,39 +276,36 @@ def price_ticker_thread():
                             state["window_slug"]    = window_slug(win_ts)
                             state["up_token"]       = m["up_token"]
                             state["down_token"]     = m["down_token"]
-                            state["market_id"]      = m["market_id"]
-                            # Seed prices from Gamma while CLOB warms up
                             state["up_price"]       = m["up_price"]
                             state["down_price"]     = m["down_price"]
-                            state["status"]         = f"Market loaded | ID {m['market_id']}"
-                        add_log(f"🕐 Window {window_slug(win_ts)} | Gamma seed UP=${m['up_price']:.4f} DOWN=${m['down_price']:.4f}")
+                            state["price_source"]   = "Gamma(seed)"
+                        add_log(f"🕐 Window {window_slug(win_ts)} | tokens loaded | Gamma seed UP=${m['up_price']:.4f} DOWN=${m['down_price']:.4f}")
                         up_token   = m["up_token"]
                         down_token = m["down_token"]
                         last_loaded_window = win_ts
 
-            # Fetch live CLOB prices every tick
+            # Fetch live prices every tick
             if up_token and down_token:
-                up_ask   = fetch_clob_best_price(up_token)
-                down_ask = fetch_clob_best_price(down_token)
+                up_p, dn_p, source = get_live_prices(up_token, down_token, win_ts)
 
-                now  = now_ts()
-                elapsed   = now - win_ts
+                now_t   = now_ts()
+                elapsed  = now_t - win_ts
                 remaining = 300 - elapsed
 
                 with lock:
-                    if up_ask is not None:
-                        state["up_price"] = up_ask
-                    if down_ask is not None:
-                        state["down_price"] = down_ask
+                    if up_p:
+                        state["up_price"]    = up_p
+                    if dn_p:
+                        state["down_price"]  = dn_p
+                    state["price_source"]    = source
                     state["time_in_window"]  = elapsed
                     state["window_close_in"] = max(0, remaining)
-                    state["tick_count"]      += 1
-                    state["last_tick"]        = utc_time()
+                    state["tick_count"]     += 1
+                    state["last_tick"]       = utc_time()
 
-                # Log every tick so dashboard shows live activity
-                up_show   = up_ask   if up_ask   is not None else state["up_price"]
-                down_show = down_ask if down_ask is not None else state["down_price"]
-                add_log(f"📈 Tick | UP ${up_show:.4f} | DOWN ${down_show:.4f} | T+{elapsed}s | -{remaining}s")
+                up_show  = up_p  if up_p  else state["up_price"]
+                dn_show  = dn_p  if dn_p  else state["down_price"]
+                add_log(f"📈 [{source}] UP ${up_show:.4f} | DOWN ${dn_show:.4f} | T+{elapsed}s | -{remaining}s")
 
         except Exception as e:
             add_log(f"❌ Ticker error: {e}")
@@ -264,29 +314,24 @@ def price_ticker_thread():
 
 # ─── THREAD 2: TRADE LOGIC ───────────────────────────────────────────────────
 def trade_logic_thread():
-    """
-    Checks every 1 second if it's time to fire trades.
-    Reads prices from shared state (set by ticker thread).
-    Never fetches prices itself.
-    """
     add_log("🧠 Trade logic thread started")
-    last_window    = None
-    trade1_done    = False
-    trade2_done    = False
-    resolved_done  = False
-    prev_result    = None
+    last_window   = None
+    trade1_done   = False
+    trade2_done   = False
+    resolved_done = False
+    prev_result   = None
 
     while True:
         try:
             win_ts = current_window_ts()
-            now    = now_ts()
 
             with lock:
                 elapsed    = state["time_in_window"]
                 up_price   = state["up_price"]
                 down_price = state["down_price"]
+                source     = state["price_source"]
 
-            # ── New window reset ──────────────────────────────────────────────
+            # ── New window ────────────────────────────────────────────────────
             if win_ts != last_window:
                 last_window   = win_ts
                 trade1_done   = False
@@ -294,99 +339,106 @@ def trade_logic_thread():
                 resolved_done = False
                 prev_result   = None
                 with lock:
-                    state["trade1_done"] = False
-                    state["trade2_done"] = False
-                    state["direction"]   = "—"
+                    state["trade1_done"]        = False
+                    state["trade2_done"]        = False
+                    state["direction"]          = "—"
                     state["prev_window_result"] = "Fetching…"
-                    state["status"]      = "New window — fetching prev result"
+                    state["status"]             = "New window"
 
-                # Fetch previous window result
                 prev_win_ts = win_ts - 300
-                add_log(f"🔍 Checking prev window {window_slug(prev_win_ts)}")
+                add_log(f"🔍 Fetching prev result: {window_slug(prev_win_ts)}")
                 result = get_prev_result(prev_win_ts)
                 if result:
                     prev_result = result
                     with lock:
                         state["prev_window_result"] = result
                         state["direction"]          = result
-                    add_log(f"📊 Prev window: {result} → momentum signal = {result}")
+                    add_log(f"📊 Prev window: {result} → momentum = {result}")
                 else:
-                    add_log("⚠️  Prev window not resolved yet, will retry…")
+                    add_log("⚠️  Prev window not resolved yet")
                     with lock:
-                        state["prev_window_result"] = "Unresolved"
+                        state["prev_window_result"] = "Pending"
 
-            # ── Retry prev result if not found yet ────────────────────────────
-            if not prev_result and elapsed < 30:
-                prev_win_ts = win_ts - 300
-                result = get_prev_result(prev_win_ts)
+            # ── Retry prev result ─────────────────────────────────────────────
+            if not prev_result and elapsed < 45:
+                result = get_prev_result(win_ts - 300)
                 if result:
                     prev_result = result
                     with lock:
                         state["prev_window_result"] = result
                         state["direction"]          = result
-                    add_log(f"📊 Late prev confirm: {result}")
+                    add_log(f"📊 Late confirm: {result}")
 
-            # ── TRADE 1: ~60s into window ─────────────────────────────────────
+            # ── Guard: don't trade on bad prices ─────────────────────────────
+            prices_valid = (up_price != down_price) and \
+                           (0.01 < up_price < 0.99 or 0.01 < down_price < 0.99) and \
+                           not (up_price >= 0.98 and down_price >= 0.98)
+
+            # ── TRADE 1 ───────────────────────────────────────────────────────
             if not trade1_done and elapsed >= TRADE1_OFFSET and prev_result:
-                direction   = prev_result
-                entry_price = up_price if direction == "UP" else down_price
-
-                if MIN_ENTRY_PRICE <= entry_price <= MAX_ENTRY_PRICE:
-                    add_log(f"⚡ T1 trigger @ T+{elapsed}s | {direction} @ ${entry_price:.4f}")
-                    ok = execute_demo_trade(direction, TRADE1_SHARES, entry_price, 1, win_ts)
-                    if ok:
-                        with lock:
-                            state["status"]      = f"T1 placed → {direction}"
-                            state["trade1_done"] = True
+                if not prices_valid:
+                    add_log(f"⚠️  T1 held — prices look invalid ({source}) UP={up_price:.4f} DOWN={down_price:.4f}")
                 else:
-                    add_log(f"🚫 T1 skipped | ${entry_price:.4f} outside [{MIN_ENTRY_PRICE}–{MAX_ENTRY_PRICE}]")
-                    with lock:
-                        state["status"]      = "T1 skipped (price filter)"
-                        state["trade1_done"] = True
+                    direction   = prev_result
+                    entry_price = up_price if direction == "UP" else down_price
+                    if MIN_ENTRY_PRICE <= entry_price <= MAX_ENTRY_PRICE:
+                        add_log(f"⚡ T1 | {direction} @ ${entry_price:.4f} [{source}] T+{elapsed}s")
+                        ok = execute_demo_trade(direction, TRADE1_SHARES, entry_price, 1, win_ts)
+                        if ok:
+                            with lock:
+                                state["status"]      = f"T1 placed → {direction}"
+                                state["trade1_done"] = True
+                    else:
+                        add_log(f"🚫 T1 skipped | ${entry_price:.4f} outside [{MIN_ENTRY_PRICE}–{MAX_ENTRY_PRICE}]")
+                        with lock:
+                            state["status"]      = "T1 skipped (price filter)"
+                            state["trade1_done"] = True
                 trade1_done = True
 
-            # ── TRADE 2: ~210s into window (value entry) ──────────────────────
+            # ── TRADE 2 ───────────────────────────────────────────────────────
             if not trade2_done and elapsed >= TRADE2_OFFSET and prev_result:
-                direction   = prev_result
-                entry_price = up_price if direction == "UP" else down_price
-
-                if entry_price <= VALUE_THRESHOLD and MIN_ENTRY_PRICE <= entry_price:
-                    add_log(f"💎 T2 VALUE @ T+{elapsed}s | {direction} still @ ${entry_price:.4f} (<{VALUE_THRESHOLD}) — entering!")
-                    ok = execute_demo_trade(direction, TRADE2_SHARES, entry_price, 2, win_ts)
-                    if ok:
-                        with lock:
-                            state["status"]      = f"T2 placed → {direction}"
-                            state["trade2_done"] = True
-                elif entry_price > VALUE_THRESHOLD:
-                    add_log(f"⏭️  T2 skipped | ${entry_price:.4f} > {VALUE_THRESHOLD} — market priced in")
-                    with lock:
-                        state["status"]      = "T2 skipped (already priced)"
-                        state["trade2_done"] = True
+                if not prices_valid:
+                    add_log(f"⚠️  T2 held — prices look invalid ({source}) UP={up_price:.4f} DOWN={down_price:.4f}")
                 else:
-                    add_log(f"🚫 T2 skipped | ${entry_price:.4f} below min filter")
-                    with lock:
-                        state["trade2_done"] = True
+                    direction   = prev_result
+                    entry_price = up_price if direction == "UP" else down_price
+                    if entry_price <= VALUE_THRESHOLD and MIN_ENTRY_PRICE <= entry_price:
+                        add_log(f"💎 T2 VALUE | {direction} @ ${entry_price:.4f} (<{VALUE_THRESHOLD}) T+{elapsed}s")
+                        ok = execute_demo_trade(direction, TRADE2_SHARES, entry_price, 2, win_ts)
+                        if ok:
+                            with lock:
+                                state["status"]      = f"T2 placed → {direction}"
+                                state["trade2_done"] = True
+                    elif entry_price > VALUE_THRESHOLD:
+                        add_log(f"⏭️  T2 skipped | ${entry_price:.4f} > {VALUE_THRESHOLD} (priced in)")
+                        with lock:
+                            state["status"]      = "T2 skipped (priced in)"
+                            state["trade2_done"] = True
+                    else:
+                        add_log(f"🚫 T2 skipped | ${entry_price:.4f} below min filter")
+                        with lock:
+                            state["trade2_done"] = True
                 trade2_done = True
 
-            # ── RESOLVE: After window closes ──────────────────────────────────
+            # ── RESOLVE ───────────────────────────────────────────────────────
             remaining = 300 - elapsed
             if not resolved_done and remaining <= 3:
-                add_log(f"⏳ Window closing, waiting 8s for resolution…")
+                add_log("⏳ Window closing — waiting 8s for resolution…")
                 time.sleep(8)
-                winner = get_prev_result(win_ts)   # This window is now the prev
+                winner = get_prev_result(win_ts)
                 if winner:
                     resolve_window(win_ts, winner)
                     resolved_done = True
                     with lock:
                         state["status"] = f"Settled → {winner}"
-                    add_log(f"🏁 Window {window_slug(win_ts)} → {winner}")
+                    add_log(f"🏁 {window_slug(win_ts)} settled → {winner}")
                 else:
-                    add_log("⚠️  Resolution pending, retrying next tick…")
+                    add_log("⚠️  Resolution pending, retrying…")
 
         except Exception as e:
             add_log(f"❌ Trade logic error: {e}")
 
-        time.sleep(TRADE_INTERVAL)
+        time.sleep(1)
 
 # ─── FLASK DASHBOARD ──────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -398,14 +450,14 @@ DASHBOARD = """
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="refresh" content="2">
-<title>BTC 5M Bot v2</title>
+<title>BTC 5M Bot v3</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0d0f14;color:#e2e8f0;font-family:'Segoe UI',sans-serif;font-size:14px}
 .hdr{background:#111827;padding:14px 16px;border-bottom:2px solid #f7931a;display:flex;justify-content:space-between;align-items:center}
 .hdr h1{color:#f7931a;font-size:18px;font-weight:700}
-.hdr .tick{font-size:11px;color:#64748b}
 .badge{display:inline-block;background:#1e3a5f;color:#60a5fa;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;margin-left:6px}
+.src{font-size:10px;padding:2px 7px;border-radius:8px;margin-left:6px;background:#1e2535;color:#94a3b8}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:12px}
 .card{background:#1a1f2e;border-radius:10px;padding:14px;border:1px solid #2d3748}
 .full{grid-column:1/-1}
@@ -413,7 +465,7 @@ body{background:#0d0f14;color:#e2e8f0;font-family:'Segoe UI',sans-serif;font-siz
 .val{font-size:22px;font-weight:700}
 .green{color:#22c55e}.red{color:#ef4444}.gold{color:#f7931a}.blue{color:#60a5fa}.gray{color:#64748b}
 .bar-wrap{background:#2d3748;border-radius:6px;height:10px;margin-top:8px;overflow:hidden}
-.bar-fill{height:100%;border-radius:6px;background:linear-gradient(90deg,#22c55e,#f7931a);transition:width .5s}
+.bar-fill{height:100%;border-radius:6px;background:linear-gradient(90deg,#22c55e,#f7931a)}
 .px{display:flex;gap:8px;margin-top:10px}
 .pbox{flex:1;text-align:center;border-radius:8px;padding:10px 4px;font-weight:700;font-size:17px}
 .pup{background:#14532d;color:#22c55e;border:1px solid #22c55e}
@@ -427,15 +479,16 @@ td{padding:7px 6px;border-bottom:1px solid #1e2535}
 .bup{background:#14532d;color:#22c55e}.bdn{background:#450a0a;color:#ef4444}
 .t1{color:#a78bfa}.t2{color:#f59e0b}
 .status{font-size:11px;color:#94a3b8;margin-top:3px}
+.warn{color:#f59e0b;font-size:11px;margin-top:4px}
 </style>
 </head>
 <body>
 <div class="hdr">
   <div>
-    <h1>⚡ BTC 5-Min Bot <span class="badge">DEMO</span></h1>
-    <div class="status">{{ slug }} &nbsp;·&nbsp; {{ status }}</div>
+    <h1>⚡ BTC 5-Min Bot <span class="badge">DEMO v3</span><span class="src">src: {{ src }}</span></h1>
+    <div class="status">{{ slug }} · {{ status }}</div>
   </div>
-  <div class="tick">🟢 Tick #{{ ticks }}<br>{{ last_tick }}</div>
+  <div style="text-align:right;font-size:11px;color:#64748b">🟢 Tick #{{ ticks }}<br>{{ last_tick }}</div>
 </div>
 
 <div class="grid">
@@ -443,9 +496,7 @@ td{padding:7px 6px;border-bottom:1px solid #1e2535}
   <div class="card">
     <div class="lbl">Balance</div>
     <div class="val gold">${{ "%.2f"|format(balance) }}</div>
-    <div style="font-size:12px;margin-top:4px;color:{{ '#22c55e' if pnl>=0 else '#ef4444' }}">
-      P&L {{ "%+.2f"|format(pnl) }}
-    </div>
+    <div style="font-size:12px;margin-top:4px;color:{{ '#22c55e' if pnl>=0 else '#ef4444' }}">P&L {{ "%+.2f"|format(pnl) }}</div>
   </div>
 
   <div class="card">
@@ -457,12 +508,15 @@ td{padding:7px 6px;border-bottom:1px solid #1e2535}
   </div>
 
   <div class="card full">
-    <div class="lbl">Window — T+{{ elapsed }}s elapsed &nbsp;|&nbsp; closes in {{ close_in }}s</div>
+    <div class="lbl">Window · T+{{ elapsed }}s · closes in {{ close_in }}s</div>
     <div class="bar-wrap"><div class="bar-fill" style="width:{{ [elapsed/300*100,100]|min }}%"></div></div>
     <div class="px">
       <div class="pbox pup">↑ UP &nbsp; ${{ "%.4f"|format(up_price) }}</div>
       <div class="pbox pdown">↓ DOWN ${{ "%.4f"|format(down_price) }}</div>
     </div>
+    {% if up_price >= 0.98 and down_price >= 0.98 %}
+    <div class="warn">⚠️ Both prices ≥0.98 — price feed issue detected, trades paused</div>
+    {% endif %}
     <div style="font-size:11px;color:#64748b;margin-top:8px">
       Prev: <strong style="color:#e2e8f0">{{ prev_result }}</strong>
       &nbsp;·&nbsp; Signal: <strong style="color:#f7931a">{{ direction }}</strong>
@@ -480,16 +534,12 @@ td{padding:7px 6px;border-bottom:1px solid #1e2535}
       <tr>
         <td class="{{ 't1' if p.trade_num==1 else 't2' }}">#{{ p.trade_num }}</td>
         <td><span class="b {{ 'bup' if p.direction=='UP' else 'bdn' }}">{{ p.direction }}</span></td>
-        <td>{{ p.shares }}</td>
-        <td>${{ "%.4f"|format(p.entry) }}</td>
-        <td>${{ "%.2f"|format(p.cost) }}</td>
-        <td>{{ p.time }}</td>
+        <td>{{ p.shares }}</td><td>${{ "%.4f"|format(p.entry) }}</td>
+        <td>${{ "%.2f"|format(p.cost) }}</td><td>{{ p.time }}</td>
       </tr>
       {% endfor %}
     </table>
-    {% else %}
-    <div class="gray" style="padding:10px 0">No open positions</div>
-    {% endif %}
+    {% else %}<div class="gray" style="padding:10px 0">No open positions</div>{% endif %}
   </div>
 
   <div class="card full">
@@ -501,26 +551,18 @@ td{padding:7px 6px;border-bottom:1px solid #1e2535}
       <tr>
         <td class="{{ 't1' if t.trade_num==1 else 't2' }}">#{{ t.trade_num }}</td>
         <td><span class="b {{ 'bup' if t.direction=='UP' else 'bdn' }}">{{ t.direction }}</span></td>
-        <td>{{ t.shares }}</td>
-        <td>${{ "%.4f"|format(t.entry) }}</td>
-        <td>${{ "%.2f"|format(t.cost) }}</td>
-        <td>${{ "%.2f"|format(t.payout) }}</td>
+        <td>{{ t.shares }}</td><td>${{ "%.4f"|format(t.entry) }}</td>
+        <td>${{ "%.2f"|format(t.cost) }}</td><td>${{ "%.2f"|format(t.payout) }}</td>
         <td style="font-weight:700;color:{{ '#22c55e' if t.pnl>=0 else '#ef4444' }}">{{ "%+.2f"|format(t.pnl) }}</td>
       </tr>
       {% endfor %}
     </table>
-    {% else %}
-    <div class="gray" style="padding:10px 0">No settled trades yet</div>
-    {% endif %}
+    {% else %}<div class="gray" style="padding:10px 0">No settled trades yet</div>{% endif %}
   </div>
 
   <div class="card full">
     <div class="lbl">Live Activity Log</div>
-    <div class="log" id="log">
-      {% for line in log_lines[-40:]|reverse %}
-      <div>{{ line }}</div>
-      {% endfor %}
-    </div>
+    <div class="log">{% for line in log_lines[-40:]|reverse %}<div>{{ line }}</div>{% endfor %}</div>
   </div>
 
 </div>
@@ -534,49 +576,38 @@ def dashboard():
         s = dict(state)
     return render_template_string(
         DASHBOARD,
-        balance     = s["balance"],
-        pnl         = s["total_pnl"],
-        wins        = s["wins"],
-        losses      = s["losses"],
-        slug        = s["window_slug"],
-        status      = s["status"],
-        up_price    = s["up_price"],
-        down_price  = s["down_price"],
-        elapsed     = s["time_in_window"],
-        close_in    = s["window_close_in"],
-        prev_result = s["prev_window_result"],
-        direction   = s["direction"],
-        positions   = s["positions"],
-        closed      = s["closed_trades"],
-        log_lines   = s["log_lines"],
-        ticks       = s["tick_count"],
-        last_tick   = s["last_tick"],
-        t1          = s["trade1_done"],
-        t2          = s["trade2_done"],
+        balance    = s["balance"],
+        pnl        = s["total_pnl"],
+        wins       = s["wins"],
+        losses     = s["losses"],
+        slug       = s["window_slug"],
+        status     = s["status"],
+        up_price   = s["up_price"],
+        down_price = s["down_price"],
+        elapsed    = s["time_in_window"],
+        close_in   = s["window_close_in"],
+        prev_result= s["prev_window_result"],
+        direction  = s["direction"],
+        positions  = s["positions"],
+        closed     = s["closed_trades"],
+        log_lines  = s["log_lines"],
+        ticks      = s["tick_count"],
+        last_tick  = s["last_tick"],
+        t1         = s["trade1_done"],
+        t2         = s["trade2_done"],
+        src        = s["price_source"],
     )
 
 @app.route("/health")
 def health():
     with lock:
-        return {
-            "status":  "ok",
-            "balance": state["balance"],
-            "pnl":     state["total_pnl"],
-            "ticks":   state["tick_count"],
-            "window":  state["window_slug"],
-        }
+        return {"status": "ok", "balance": state["balance"],
+                "pnl": state["total_pnl"], "ticks": state["tick_count"],
+                "price_source": state["price_source"]}
 
-# ─── ENTRY ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-
-    # Thread 1: Price ticker (every 1s, CLOB)
-    t1 = threading.Thread(target=price_ticker_thread, daemon=True)
-    t1.start()
-
-    # Thread 2: Trade logic (every 1s, reads from state)
-    t2 = threading.Thread(target=trade_logic_thread, daemon=True)
-    t2.start()
-
+    threading.Thread(target=price_ticker_thread, daemon=True).start()
+    threading.Thread(target=trade_logic_thread,  daemon=True).start()
     add_log(f"🌐 Dashboard → http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
